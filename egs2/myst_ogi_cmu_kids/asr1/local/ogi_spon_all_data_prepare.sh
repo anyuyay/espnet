@@ -17,7 +17,7 @@ for x in spont_all; do
   paste -d' ' $data/$x/all.uttids $tmpdir/all.wav | sort -k1,1 > $data/$x/wav.scp
 
   while read line; do
-    [ -f $line ] || error_exit "Cannot find transcription file '$line'";
+    [ -f "$line" ] || { echo "Cannot find transcription file '$line'" >&2; exit 1; }
     head -n1 "$line" # | sed "s:<[^ ]*>::g" | sed "s:([^ ]*)::g" | sed "s:  : :g" | sed "s:  : :g" | sed "s:^ ::g" | sed "s:\[::g" | sed "s:\]::g" | sed "s:\*::g" | sed "s:^\xEF\xBB\xBF::g" | tr '[:lower:]' '[:upper:]'
   done < $tmpdir/all.txt > $tmpdir/trans
   paste -d' ' $data/$x/all.uttids $tmpdir/trans | sort -k1,1 > $data/$x/text

@@ -81,7 +81,7 @@ fi
 
 # this stage is for MyST
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
-    if "${flac2wav}"; then
+    if ${flac2wav}; then
         log "stage 2: Convert flac to wav"
         original_dir="${MYST}/myst_child_conv_speech/data"
         logdir="${MYST}/myst_child_conv_speech/log"
