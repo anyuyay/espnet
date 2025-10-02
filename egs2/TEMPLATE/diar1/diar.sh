@@ -23,8 +23,8 @@ min() {
 SECONDS=0
 
 # General configuration
-stage=1                 # Processes starts from the specified stage.
-stop_stage=10000        # Processes is stopped at the specified stage.
+stage=0                 # Processes starts from the specified stage.
+stop_stage=10           # Processes is stopped at the specified stage.
 skip_data_prep=false    # Skip data preparation stages
 skip_train=false        # Skip training stages
 skip_eval=false         # Skip decoding and evaluation stages
@@ -55,7 +55,7 @@ diar_config= # Config for diar model training.
 diar_args=   # Arguments for diar model training, e.g., "--max_epoch 10".
              # Note that it will overwrite args in diar config.
 feats_normalize=global_mvn # Normalizaton layer type.
-num_spk=2    # Number of speakers in the input audio
+num_spk=     # Number of speakers in the input audio
 
 # diar related
 inference_config= # Config for diar model inference
@@ -70,6 +70,11 @@ hf_repo=
 collar=0         # collar for der scoring
 frame_shift=128  # frame shift to convert frame-level label into real time
                  # this should be aligned with frontend feature extraction
+subsampling=1    # subsampling factor for scoring
+
+# RTTM generation related
+median=1         # median filter size (frames) for smoothing the binary speech activity sequence
+threshold=0.5    # posterior probability threshold above which a frame is considered active (speech)
 
 # [Task dependent] Set the datadir name created by local/data.sh
 train_set=       # Name of training set.
@@ -535,19 +540,165 @@ if ! "${skip_eval}"; then
         done
     fi
 
-    if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
-        log "Stage 7: Scoring"
+    # ===== Stage 6.5: Hybrid embedding + clustering (EEND -> embeddings -> AHC/VBx) =====
+    # Inputs:
+    #   - ${data_feats}/${dset}/wav.scp
+    #   - ${diar_exp}/diarized_${dset}/scoring/${hybrid_rttm_name}   (from Stage 6)
+    # Outputs:
+    #   - ${diar_exp}/clustered_${dset}_${clustering_method}/*.rttm
+    #   - ${diar_exp}/clustered_${dset}_${clustering_method}/diarize.scp
+
+    # ---- Config (safe defaults + debug) ----
+    # ---- Hybrid (Stage 6.5) defaults ----
+    hybrid_enable=true
+    hybrid_rttm_name=hyp_0.5_1.rttm     # under diarized_${dset}/scoring/
+    clustering_method=AHC               # AHC | VBx
+    embedding_backend=xvector           # xvector | ecapa | wavlm
+    embedding_model=pretrained/xvec     # path or HF hub id
+
+    # AHC / VBx params
+    ahc_stop_thr=0.70
+    vb_plda_dir=
+    vb_lda_dim=128
+    vb_max_iters=20
+
+    # RTTM->segments options
+    rttm_min_dur=0.0                    # drop segments shorter than this (sec)
+    rttm_merge_within=0.0               # merge same-spk regions if gap<value (sec)
+    rttm_keep_overlap=true              # keep overlapped regions (recommended)
+    hybrid_debug=true
+    
+    # ===== Stage 7: Use RTTM -> segments, then embedding + clustering =====
+    if ${hybrid_enable} && [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
+        log "Stage 7: Hybrid embedding+clustering (method=${clustering_method}, backend=${embedding_backend})"
+
+        if ${gpu_inference}; then
+            _cmd=${cuda_cmd}
+            _ngpu=1
+        else
+            _cmd=${decode_cmd}
+            _ngpu=0
+        fi
+
+        for dset in "${valid_set}" ${test_sets}; do
+            _data="${data_feats}/${dset}"
+            _stage6_dir="${diar_exp}/diarized_${dset}"
+            _stage6_scp="${_stage6_dir}/diarize.scp"
+            _score_dir="${_stage6_dir}/scoring"
+            mkdir -p "${_score_dir}"
+
+            # Build the RTTM path we want to use later
+            _rttm="${_score_dir}/${hybrid_rttm_name}"
+
+            # If missing, convert Stage-6 .scp/.npy -> RTTM once
+            if [ ! -s "${_rttm}" ]; then
+                log "RTTM not found, making it with make_rttm.py: ${_rttm}"
+                pyscripts/utils/make_rttm.py \
+                    --threshold "${threshold}" \
+                    --median    "${median}" \
+                    --frame_shift "${frame_shift}" \
+                    --subsampling "${subsampling}" \
+                    --sampling_rate "${fs}" \
+                    "${_stage6_scp}" "${_rttm}" \
+                || { log "ERROR: make_rttm.py failed for ${dset}"; exit 1; }
+            else
+                log "Found existing RTTM: ${_rttm}"
+            fi
+
+            _out_dir="${diar_exp}/clustered_${dset}_${clustering_method}"
+            _logdir="${_out_dir}/logdir"
+            _work="${_out_dir}/work"
+            mkdir -p "${_out_dir}" "${_logdir}" "${_work}"
+
+            # 0) Convert RTTM -> segments (+ utt2spk_local for debugging)
+            log "RTTM -> segments for ${dset}"
+            ${python} -u pyscripts/utils/rttm_to_segments.py \
+                --rttm "${_rttm}" \
+                --out_segments "${_work}/segments.eend" \
+                --out_utt2spk_local "${_work}/utt2spk_local"
+
+            # 1) Split keys (like Stage 6)
+            key_file="${_data}/wav.scp"
+            split_scps=""
+            _nj=$(min "${inference_nj}" "$(<${key_file} wc -l)")
+            for n in $(seq "${_nj}"); do
+                split_scps+=" ${_logdir}/keys.${n}.scp"
+            done
+            utils/split_scp.pl "${key_file}" ${split_scps}
+
+            # 2) Make per-JOB segments and utt2spk_local
+            for n in $(seq "${_nj}"); do
+                utils/filter_scp.pl -f 2 "${_logdir}/keys.${n}.scp" \
+                    "${_work}/segments.eend" > "${_logdir}/segments.${n}"
+                cut -d' ' -f1 "${_logdir}/segments.${n}" | utils/filter_scp.pl - \
+                    "${_work}/utt2spk_local" > "${_logdir}/utt2spk_local.${n}"
+            done
+
+            log "Hybrid embedding+clustering started... logs at '${_logdir}/hybrid.JOB.log'"
+
+            # 3) Per-JOB embedding + clustering
+            ${_cmd} --gpu "${_ngpu}" JOB=1:"${_nj}" "${_logdir}"/hybrid.JOB.log \
+                ${python} -u local/embed_cluster_from_segments.py \
+                    --wav_scp             "${_logdir}/keys.JOB.scp" \
+                    --segments            "${_logdir}/segments.JOB" \
+                    --utt2spk_local       "${_logdir}/utt2spk_local.JOB" \
+                    --backend             "${embedding_backend}" \
+                    --embed_model         "${embedding_model}" \
+                    --method              "${clustering_method}" \
+                    --ahc_stop_thr        "${ahc_stop_thr}" \
+                    --vb_plda_dir         "${vb_plda_dir}" \
+                    --vb_lda_dim          "${vb_lda_dim}" \
+                    --vb_max_iters        "${vb_max_iters}" \
+                    --fs                  "${fs}" \
+                    --ngpu                "${_ngpu}" \
+                    --debug               "${hybrid_debug}" \
+                    --work_dir            "${_logdir}/job.JOB" \
+                    --out_dir             "${_out_dir}" \
+            || { cat $(grep -l -i -E "error|exception" "${_logdir}"/hybrid.*.log); exit 1; }
+
+            # 4) Gather per-recording RTTMs -> diarize.scp
+            find "${_out_dir}" -maxdepth 1 -name '*.rttm' | awk -F/ '{print $NF}' | sed 's/\.rttm$//' \
+                | while read -r rid; do
+                    echo "${rid} ${_out_dir}/${rid}.rttm"
+                done | LC_ALL=C sort -k1 > "${_out_dir}/diarize.scp"
+
+            log "Hybrid RTTMs collected: ${_out_dir}/diarize.scp"
+
+            _hyp_rttm_dir="${_out_dir}/scoring/hyp_rttm"
+            mkdir -p "${_hyp_rttm_dir}"
+            while read -r rid rttm_path; do
+                ln -sf "$(realpath "${rttm_path}")" "${_hyp_rttm_dir}/${rid}.rttm"
+            done < "${_out_dir}/diarize.scp"
+        done
+    fi
+
+    
+    if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
+        log "Stage 8: Scoring"
         _cmd=${decode_cmd}
 
         for dset in "${valid_set}" ${test_sets}; do
             _data="${data_feats}/${dset}"
-            _inf_dir="${diar_exp}/diarized_${dset}"
-            _dir="${diar_exp}/diarized_${dset}/scoring"
-            mkdir -p "${_dir}"
 
-            scripts/utils/score_der.sh \
-                --collar ${collar} --fs ${fs} --frame_shift ${frame_shift} \
-                ${_dir} ${_inf_dir}/diarize.scp ${_data}/rttm \
+            if ! ${hybrid_enable}; then
+                # ===== Score baseline EEND outputs =====
+                _inf_dir="${diar_exp}/diarized_${dset}"
+                _dir="${_inf_dir}/scoring"
+                mkdir -p "${_dir}"
+
+                log "Scoring EEND outputs for ${dset}"
+                scripts/utils/score_der.sh ${_dir} ${_inf_dir}/diarize.scp \
+                    ${_data}/rttm ${collar} ${fs} ${frame_shift} ${subsampling}
+            else
+                # ===== Score Hybrid outputs =====
+                _hybrid_inf_dir="${diar_exp}/clustered_${dset}_${clustering_method}"
+                _dir="${_hybrid_inf_dir}/scoring"
+                mkdir -p "${_dir}"
+
+                log "Scoring Hybrid outputs (${clustering_method}) for ${dset}"
+                scripts/utils/score_der.sh ${_dir} ${_hybrid_inf_dir}/diarize.scp \
+                    ${_data}/rttm ${collar} ${fs} ${frame_shift} ${subsampling}
+            fi
         done
 
         # Show results in Markdown syntax
@@ -563,8 +714,8 @@ fi
 packed_model="${diar_exp}/${diar_exp##*/}_${inference_model%.*}.zip"
 # Skip pack preparation if using a downloaded model or skip_packing is true
 if ! "${skip_packing}" && [ -n "${download_model}" ]; then
-    if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
-        log "Stage 8: Pack model: ${packed_model}"
+    if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
+        log "Stage 9: Pack model: ${packed_model}"
 
         ${python} -m espnet2.bin.pack diar \
             --train_config "${diar_exp}"/config.yaml \
@@ -579,11 +730,11 @@ else
 fi
 
 if ! "${skip_upload_hf}"; then
-    if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
+    if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ]; then
         [ -z "${hf_repo}" ] && \
             log "ERROR: You need to setup the variable hf_repo with the name of the repository located at HuggingFace" && \
             exit 1
-        log "Stage 9: Upload model to HuggingFace: ${hf_repo}"
+        log "Stage 10: Upload model to HuggingFace: ${hf_repo}"
 
         if [ ! -f "${packed_model}" ]; then
             log "ERROR: ${packed_model} does not exist. Please run stage 8 first."
